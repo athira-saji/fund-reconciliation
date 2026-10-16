@@ -302,13 +302,14 @@ def confirm_match(request, match_id):
 
     with transaction.atomic():
         #lock rows to prevent concurrent double funding
-        txn = BankTransaction.objects.select_for_update().get(id=suggestion.transaction_id)
+        txn = BankTransaction.objects.select_for_update().get(id=suggestion.transaction_id, organization=org)
+        suggestion = MatchSuggestion.objects.select_for_update().get(id=match_id, transaction=txn)
         line_item = CapitalCallLineItem.objects.select_for_update().get(id=suggestion.line_item_id)
 
         #if already reconciled or match already approved
-        if txn.status == "reconciled" or suggestion.status == "approved":
+        if txn.status == "reconciled" or suggestion.status != "proposed":
             return Response(
-                {"error": "transaction already reconciled"},
+                {"error": "match is no longer available for approval"},
                 status=status.HTTP_409_CONFLICT,
             )
 
