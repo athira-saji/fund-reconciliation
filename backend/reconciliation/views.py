@@ -6,6 +6,8 @@ import re
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
+from django.db import transaction
+from rest_framework import status
 
 from reconciliation.models import (
     BankTransaction,
@@ -284,69 +286,83 @@ def upload_csv(request):
 def confirm_match(request, match_id):
     slug = request.headers.get("X-Organization")
     if not slug:
-        return Response({"error": "missing header"}, status=400)
+        return Response({"error": "missing header"}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         org = Organization.objects.get(slug=slug)
     except Organization.DoesNotExist:
-        return Response({"error": "not found"}, status=404)
+        return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
 
     try:
         suggestion = MatchSuggestion.objects.get(
             id=match_id, transaction__organization=org
         )
     except MatchSuggestion.DoesNotExist:
-        return Response({"error": "suggestion not found"}, status=404)
+        return Response({"error": "suggestion not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    txn = suggestion.transaction
-    line_item = suggestion.line_item
+    with transaction.atomic():
+        #lock rows to prevent concurrent double funding
+        txn = BankTransaction.objects.select_for_update().get(id=suggestion.transaction_id)
+        line_item = CapitalCallLineItem.objects.select_for_update().get(id=suggestion.line_item_id)
 
-    if txn.status == "reconciled":
-        return Response(
-            {"error": "transaction is already reconciled"}, status=400
-        )
-    
-    #update line item funding
-    line_item.amount_funded += txn.amount
-    if line_item.amount_funded >= line_item.amount_called:
-        line_item.status = "funded"
-    else:
-        line_item.status = "partially_funded"
-    line_item.save(update_fields=["amount_funded", "status"])
+        #if already reconciled or match already approved
+        if txn.status == "reconciled" or suggestion.status == "approved":
+            return Response(
+                {"error": "transaction already reconciled"},
+                status=status.HTTP_409_CONFLICT,
+            )
 
-    suggestion.status = "approved"
-    suggestion.save()
+        #if amount exceeds remaining balance
+        remaining = line_item.amount_called - line_item.amount_funded
+        if txn.amount > remaining:
+            return Response(
+                {"error": "amount exceeds remaining balance"},
+                status=status.HTTP_409_CONFLICT,
+            )
 
-    txn.status = "reconciled"
-    txn.save()
+        # update line item
+        line_item.amount_funded += txn.amount
+        if line_item.amount_funded >= line_item.amount_called:
+            line_item.status = "funded"
+        else:
+            line_item.status = "partially_funded"
+        line_item.save(update_fields=["amount_funded", "status"])
 
-    #reject other suggestions for this transaction
-    MatchSuggestion.objects.filter(transaction=txn, status="proposed").update(
-        status="rejected"
-    )
+        # approve chosen match
+        suggestion.status = "approved"
+        suggestion.save(update_fields=["status"])
 
-    return Response({"message": "match confirmed successfully"}, status=200)
+        # reject other matches on this transaction
+        MatchSuggestion.objects.filter(transaction=txn, status="proposed").exclude(
+            id=suggestion.id
+        ).update(status="rejected")
+
+        # mark transaction reconciled
+        txn.status = "reconciled"
+        txn.save(update_fields=["status"])
+
+    return Response({"message": "match approved successfully"}, status=status.HTTP_200_OK)
 
 @api_view(["POST"])
 def reject_match(request, match_id):
     slug = request.headers.get("X-Organization")
     if not slug:
-        return Response({"error": "missing header"}, status=400)
+        return Response({"error": "missing header"}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         org = Organization.objects.get(slug=slug)
     except Organization.DoesNotExist:
-        return Response({"error": "not found"}, status=404)
+        return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
 
     try:
         suggestion = MatchSuggestion.objects.get(
             id=match_id, transaction__organization=org
         )
     except MatchSuggestion.DoesNotExist:
-        return Response({"error": "suggestion not found"}, status=404)
+        return Response({"error": "suggestion not found"}, status=status.HTTP_404_NOT_FOUND)
 
     txn = suggestion.transaction
-
+    
     suggestion.status = "rejected"
     suggestion.save()
 
@@ -359,4 +375,69 @@ def reject_match(request, match_id):
         txn.status = "needs_review"
         txn.save()
 
-    return Response({"message": "match rejected successfully"}, status=200)
+    return Response({"message": "match rejected successfully"}, status=status.HTTP_200_OK)
+
+@api_view(["GET"])
+def list_capital_call_line_items(request):
+    slug = request.headers.get("X-Organization")
+    if not slug:
+        return Response({"error": "missing header"}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        org = Organization.objects.get(slug=slug)
+    except Organization.DoesNotExist:
+        return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    items = (
+        CapitalCallLineItem.objects.filter(organization=org)
+        .select_related("capital_call", "investor_entity")
+        .order_by("id")
+    )
+
+    data = []
+    for item in items:
+        remaining = item.amount_called - item.amount_funded
+        data.append({
+            "id": item.id,
+            "capital_call_name": item.capital_call.identifier,
+            "call_date": str(item.capital_call.call_date),
+            "investor_name": item.investor_entity.name,
+            "amount_called": str(item.amount_called),
+            "amount_funded": str(item.amount_funded),
+            "remaining_amount": str(remaining),
+            "expected_reference": item.expected_reference,
+            "status": item.status,
+        })
+
+    return Response(data, status=status.HTTP_200_OK)
+
+@api_view(["POST"])
+def ignore_transaction(request, transaction_id):
+    slug = request.headers.get("X-Organization")
+    if not slug:
+        return Response({"error": "missing header"}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        org = Organization.objects.get(slug=slug)
+    except Organization.DoesNotExist:
+        return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    try:
+        txn = BankTransaction.objects.get(id=transaction_id, organization=org)
+    except BankTransaction.DoesNotExist:
+        return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if txn.status == "reconciled":
+        return Response(
+            {"error": "cannot ignore a reconciled transaction"},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    with transaction.atomic():
+        txn.status = "ignored"
+        txn.save(update_fields=["status"])
+        MatchSuggestion.objects.filter(transaction=txn, status="proposed").update(
+            status="rejected"
+        )
+
+    return Response({"message": "transaction ignored"}, status=status.HTTP_200_OK)
