@@ -1,0 +1,49 @@
+.container {
+  max-width: 1200px;
+  margin: 20px auto;
+  padding: 0 16px;
+  font-family: sans-serif;
+}
+
+.top-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.card {
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  padding: 16px;
+  margin-bottom: 24px;
+}
+
+.table-wrapper {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th, td {
+  border: 1px solid #ddd;
+  padding: 8px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background-color: #f7f7f7;
+}
+
+.actions-cell, .action-group {
+  display: flex;
+  gap: 6px;
+}
+
+.actions-cell {
+  flex-direction: column;
+}
