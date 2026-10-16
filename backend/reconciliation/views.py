@@ -150,3 +150,132 @@ def list_transactions(request):
         })
 
     return Response(data, status=200)
+
+@api_view(["POST"])
+@parser_classes([MultiPartParser])
+def upload_csv(request):
+    slug = request.headers.get("X-Organization")
+    if not slug:
+        return Response({"error": "missing header"}, status=400)
+
+    try:
+        org = Organization.objects.get(slug=slug)
+    except Organization.DoesNotExist:
+        return Response({"error": "not found"}, status=404)
+
+    uploaded_file = request.FILES.get("file")
+    if not uploaded_file:
+        return Response({"error": "no file provided"}, status=400)
+
+    #read text lines
+    text_data = uploaded_file.read().decode("utf-8-sig")
+    lines = [line for line in text_data.splitlines() if line.strip()]
+    if not lines:
+        return Response({"error": "empty file"}, status=400)
+
+    reader = csv.reader(lines)
+    header = [col.strip().lower() for col in next(reader)]
+
+    required = ["date", "description", "amount", "type", "reference"]
+    for req in required:
+        if req not in header:
+            return Response({"error": f"missing column {req}"}, status=400)
+
+    #map column names to index
+    d_idx = header.index("date")
+    desc_idx = header.index("description")
+    amt_idx = header.index("amount")
+    type_idx = header.index("type")
+    ref_idx = header.index("reference")
+
+    imported_count = 0
+    duplicate_count = 0
+    errors = []
+    seen_refs = set()
+
+    #process row by row
+    for line_num, row in enumerate(reader, start=2):
+        if len(row) < len(header):
+            errors.append({"line": line_num, "message": "missing columns"})
+            continue
+
+        raw_date = row[d_idx].strip()
+        raw_desc = row[desc_idx].strip()
+        raw_amt = row[amt_idx].strip().replace(",", "")
+        raw_type = row[type_idx].strip().lower()
+        raw_ref = row[ref_idx].strip()
+
+        if not raw_desc or not raw_ref:
+            errors.append({"line": line_num, "message": "description and reference are required"})
+            continue
+
+        try:
+            parsed_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except ValueError:
+            errors.append({"line": line_num, "message": f"invalid date: {raw_date}"})
+            continue
+
+        #check amount
+        try:
+            amount_val = Decimal(raw_amt)
+        except InvalidOperation:
+            errors.append({"line": line_num, "message": f"invalid amount: {raw_amt}"})
+            continue
+
+        if amount_val == Decimal("0"):
+            errors.append({"line": line_num, "message": "amount cannot be zero"})
+            continue
+
+        #check type and sign
+        if raw_type not in ["credit", "debit"]:
+            errors.append({"line": line_num, "message": f"invalid type: {raw_type}"})
+            continue
+        if raw_type == "credit" and amount_val <= 0:
+            errors.append({"line": line_num, "message": "credit must be positive"})
+            continue
+        if raw_type == "debit" and amount_val >= 0:
+            errors.append({"line": line_num, "message": "debit must be negative"})
+            continue
+
+        #duplicate check
+        already_exists = BankTransaction.objects.filter(
+            organization=org, bank_reference=raw_ref
+        ).exists()
+
+        if raw_ref in seen_refs or already_exists:
+            duplicate_count += 1
+            errors.append({"line": line_num, "message": f"duplicate reference: {raw_ref}"})
+            continue
+
+        seen_refs.add(raw_ref)
+
+        #save transaction
+        if raw_type == "debit":
+            BankTransaction.objects.create(
+                organization=org,
+                date=parsed_date,
+                description=raw_desc,
+                amount=amount_val,
+                transaction_type=raw_type,
+                bank_reference=raw_ref,
+                status="ignored",
+            )
+            imported_count += 1
+        else:
+            txn = BankTransaction.objects.create(
+                organization=org,
+                date=parsed_date,
+                description=raw_desc,
+                amount=amount_val,
+                transaction_type=raw_type,
+                bank_reference=raw_ref,
+                status="needs_review",
+            )
+            run_matcher_for_credit(txn)
+            imported_count += 1
+
+    return Response({
+        "imported": imported_count,
+        "duplicates": duplicate_count,
+        "errors": errors,
+    }, status=200)
