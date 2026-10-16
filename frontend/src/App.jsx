@@ -278,8 +278,13 @@ export default function App() {
                           t.matches.map((m) => (
                             <div key={m.id} style={{ marginBottom: "6px" }}>
                               <strong>{m.investor_name}</strong>
-                              <span className="sub-ref"> ({m.expected_reference})</span>
-                              <div><span className={`badge badge-${m.status}`}>{m.status}</span></div>
+                                <span className="sub-ref"> ({m.expected_reference})</span>
+                                <div>
+                                  <span className={`badge badge-${m.status}`}>{m.status}</span>
+                                </div>
+                                <div style={{ fontSize: "13px", color: "#475569", marginTop: "4px" }}>
+                                  {m.reason}
+                                </div>
                             </div>
                           ))
                         ) : (
