@@ -279,3 +279,84 @@ def upload_csv(request):
         "duplicates": duplicate_count,
         "errors": errors,
     }, status=200)
+
+@api_view(["POST"])
+def confirm_match(request, match_id):
+    slug = request.headers.get("X-Organization")
+    if not slug:
+        return Response({"error": "missing header"}, status=400)
+
+    try:
+        org = Organization.objects.get(slug=slug)
+    except Organization.DoesNotExist:
+        return Response({"error": "not found"}, status=404)
+
+    try:
+        suggestion = MatchSuggestion.objects.get(
+            id=match_id, transaction__organization=org
+        )
+    except MatchSuggestion.DoesNotExist:
+        return Response({"error": "suggestion not found"}, status=404)
+
+    txn = suggestion.transaction
+    line_item = suggestion.line_item
+
+    if txn.status == "reconciled":
+        return Response(
+            {"error": "transaction is already reconciled"}, status=400
+        )
+    
+    #update line item funding
+    line_item.amount_funded += txn.amount
+    if line_item.amount_funded >= line_item.amount_called:
+        line_item.status = "funded"
+    else:
+        line_item.status = "partially_funded"
+    line_item.save(update_fields=["amount_funded", "status"])
+
+    suggestion.status = "approved"
+    suggestion.save()
+
+    txn.status = "reconciled"
+    txn.save()
+
+    #reject other suggestions for this transaction
+    MatchSuggestion.objects.filter(transaction=txn, status="proposed").update(
+        status="rejected"
+    )
+
+    return Response({"message": "match confirmed successfully"}, status=200)
+
+@api_view(["POST"])
+def reject_match(request, match_id):
+    slug = request.headers.get("X-Organization")
+    if not slug:
+        return Response({"error": "missing header"}, status=400)
+
+    try:
+        org = Organization.objects.get(slug=slug)
+    except Organization.DoesNotExist:
+        return Response({"error": "not found"}, status=404)
+
+    try:
+        suggestion = MatchSuggestion.objects.get(
+            id=match_id, transaction__organization=org
+        )
+    except MatchSuggestion.DoesNotExist:
+        return Response({"error": "suggestion not found"}, status=404)
+
+    txn = suggestion.transaction
+
+    suggestion.status = "rejected"
+    suggestion.save()
+
+    #transaction needs human review if no other proposed suggestions remain
+    has_other_suggestions = MatchSuggestion.objects.filter(
+        transaction=txn, status="proposed"
+    ).exists()
+
+    if not has_other_suggestions:
+        txn.status = "needs_review"
+        txn.save()
+
+    return Response({"message": "match rejected successfully"}, status=200)
